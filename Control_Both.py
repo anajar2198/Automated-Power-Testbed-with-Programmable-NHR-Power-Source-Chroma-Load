@@ -2,7 +2,8 @@ import pyvisa
 import time
 import socket
 import msvcrt # Used for non-blocking keyboard checks on Windows
-
+import threading
+import signal
 # ======================================================================
 # ⚙️ CONFIGURATION PARAMETERS
 # ======================================================================
@@ -15,18 +16,29 @@ SIMULATOR_INSTRUMENT = 3
 LOAD_ADDRESS = "GPIB0::8::INSTR" 
 
 # --- Sweep & Test Parameters ---
+
 VOLTAGE_START_V = 100
 VOLTAGE_STOP_V = 150
-VOLTAGE_STEP_V = 25
+VOLTAGE_STEP_V = 5   # → 11 steps
 
 CURRENT_START_A = 0
-CURRENT_STOP_A = 10
-CURRENT_STEP_A = 2.5
+CURRENT_STOP_A = 15
+CURRENT_STEP_A = 2   # → 8 steps
 
 # Interval to wait at each V-I condition before measuring
-INTERVAL_S = 20
+# INTERVAL_S = 300
+INTERVAL_S = 10
 
+# --- Global flag for stop ---
+STOP_REQUESTED = False
 
+def handle_stop(signum, frame):
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+    print("\n🛑 Hard stop requested (CTRL+C or q).")
+
+# Register SIGINT (Ctrl+C) handler
+signal.signal(signal.SIGINT, handle_stop)
 def send_query_socket(sock, query):
     """Helper to send a query to a socket and get a clean response."""
     sock.sendall((query + '\n').encode())
@@ -75,9 +87,8 @@ def connect_grid_simulator(host, port):
     # Set generous protection limits
     s.sendall(b'SOURce:CURRent 20\n') # 20A current limit
     s.sendall(b'SOURce:POWer 2500\n') # 2500W power limit
-
     print_safety_limits(s)
-    
+
     print("✅ Grid Simulator connected and configured.")
     return s
 
@@ -128,53 +139,62 @@ try:
 
     # --- Prepare for sweep ---
     print("\nPreparing for test. Turning Grid Simulator ON.")
+        # --- Set a starting voltage for stability ---
+    simulator_socket.sendall((f'SOURce:VOLTage {VOLTAGE_START_V}\n').encode())
     simulator_socket.sendall(b'OUTPut ON\n')
-    time.sleep(2)
-    print("--> Press 'q' at any time to stop the sweep and save results. <--")
+    print(f"Set initial voltage to {VOLTAGE_START_V} V for stabilization.")
+    # Allow stabilization but check for stop
+    for _ in range(20):
+        if STOP_REQUESTED:
+            raise KeyboardInterrupt
+        time.sleep(1)
+    print("--> Press 'CTRL + C' at any time to stop the sweep and save results. <--")
     print("\n--- Starting Nested V-I Sweep ---")
     print(f"{'V Set (V)':<12} | {'I Set (A)':<12} | {'V Meas (V)':<12} | {'I Meas (A)':<12} | {'P Meas (W)':<12}")
     print("-" * 68)
 
     # --- Outer Loop: Voltage Sweep ---
     v_range = range(VOLTAGE_START_V, VOLTAGE_STOP_V + 1, VOLTAGE_STEP_V)
-    for v_set in v_range:
-        simulator_socket.sendall(f'VOLTage {v_set}\n'.encode())
-        time.sleep(1.5)
+    i_range = range(CURRENT_START_A, CURRENT_STOP_A + 1, CURRENT_STEP_A)
 
-        # --- Inner Loop: Current Sweep ---
-        i_set = CURRENT_START_A
-        while i_set <= CURRENT_STOP_A:
-            if msvcrt.kbhit() and msvcrt.getch().decode().lower() == 'q':
-                print("\n🛑 Hard stop requested by user!")
-                raise KeyboardInterrupt # Immediately stops the try block
-            # This is the specific command sequence required by the Chroma load in AC mode
-            load_instrument.write(f"CURRent:PEAK:MAXimum:AC {i_set * 1.5 if i_set > 0 else 0.1}")
-            load_instrument.write(f"CURR {i_set}")
-            load_instrument.write("LOAD ON")
-            time.sleep(1)
-            
-            # ADDED: Verification step to read back the current setpoint
-            # print("Verifying the current setpoint...")
-            readback_current_str = load_instrument.query("CURRent?").strip()
-            readback_current = float(readback_current_str)
-            # print(f"--> Verification successful: Instrument reports setpoint is {readback_current:.2f} A")
+    for i_set in i_range:
+        if STOP_REQUESTED:
+            raise KeyboardInterrupt
+        # This is the specific command sequence required by the Chroma load in AC mode
+        load_instrument.write(f"CURRent:PEAK:MAXimum:AC {i_set * 1.5 if i_set > 0 else 0.1}")
+        load_instrument.write(f"CURR {i_set}")
+        load_instrument.write("LOAD ON")
+        time.sleep(1)
+        # ADDED: Verification step to read back the current setpoint
+        # print("Verifying the current setpoint...")
+        readback_current_str = load_instrument.query("CURRent?").strip()
+        readback_current = float(readback_current_str)
+        # print(f"--> Verification successful: Instrument reports setpoint is {readback_current:.2f} A")
 
-            # Optional but recommended: Add a check to ensure it was set correctly
-            if abs(readback_current - i_set) > 0.1: # Check if it's within a 0.1A tolerance
-                raise Exception(f"Failed to set current correctly! Expected {i_set}, but read back {readback_current}")
-            
-            time.sleep(2) # Wait for measurement to stabilize before reading V, I, P
+        # Optional but recommended: Add a check to ensure it was set correctly
+        if abs(readback_current - i_set) > 0.1: # Check if it's within a 0.1A tolerance
+            raise Exception(f"Failed to set current correctly! Expected {i_set}, but read back {readback_current}")
         
+        # --- Inner Loop: Current Sweep ---
+        v_set = VOLTAGE_START_V
+        while v_set <= VOLTAGE_STOP_V:
+            if STOP_REQUESTED:
+                raise KeyboardInterrupt
+
+            simulator_socket.sendall(f'VOLTage {v_set}\n'.encode())
+            time.sleep(1)
+
             # Take measurements from the electronic load
             v_meas = parse_float(load_instrument.query("MEASure:VOLTage?").strip())
             i_meas = parse_float(load_instrument.query("MEASure:CURRent?").strip())
             p_meas = parse_float(load_instrument.query("MEASure:POWer?").strip())
-            
+            time.sleep(2) # Wait for measurement to stabilize before reading V, I, P
+
             # load_instrument.write("LOAD OFF")
             
             print(f"{v_set:<12.2f} | {i_set:<12.2f} | {v_meas:<12.2f} | {i_meas:<12.2f} | {p_meas:<12.2f}")
             
-            i_set += CURRENT_STEP_A
+            v_set += VOLTAGE_STEP_V
 
             time.sleep(INTERVAL_S)
         print("-" * 68)

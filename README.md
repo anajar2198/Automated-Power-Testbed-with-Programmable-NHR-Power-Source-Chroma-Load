@@ -1,4 +1,4 @@
-# NHR & Chroma Testbed Automation Suite
+# Automated Power Testbed with Programmable NHR Power Source & Chroma Load
 
 This repository contains Python scripts for automating a power electronics testbed consisting of an NHR 9400 series Grid Simulator and a Chroma 63800 series Electronic Load.
 
