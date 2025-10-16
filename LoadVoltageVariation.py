@@ -26,8 +26,8 @@ CURRENT_STOP_A = 15
 CURRENT_STEP_A = 2   # → 8 steps
 
 # Interval to wait at each V-I condition before measuring
-# INTERVAL_S = 300
-INTERVAL_S = 10
+INTERVAL_S = 300
+# INTERVAL_S = 10
 
 # --- Global flag for stop ---
 STOP_REQUESTED = False
